@@ -365,26 +365,41 @@ def register_user():
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/users', methods=['GET'])
-def get_all_users():
-    # Get all registered users
+def get_users():
+    # Get all users or specific user by ID from header
     try:
+        # Check if user ID is provided in header
+        user_id_header = request.headers.get('User-Id')
+        
+        if user_id_header and user_id_header != "":
+            try:
+                # Get specific user
+                user_id = int(user_id_header)
+                user = system.getUserInfo(user_id)
+                if user:
+                    return jsonify({
+                        "message": "User found",
+                        "user": user
+                    })
+                else:
+                    return jsonify({
+                        "error": "User not found",
+                        "userId": user_id
+                    }), 404
+                    
+            except ValueError:
+                return jsonify({
+                    "error": "Invalid user ID format. Must be a number.",
+                    "providedId": user_id_header
+                }), 400
+        
+        # If no user ID header, return all users
         users = system.getAllUsers()
         return jsonify({
             "users": users,
             "count": len(users)
         })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/users/<int:user_id>', methods=['GET'])
-def get_user_by_id(user_id):
-    # Get user information by ID
-    try:
-        user = system.getUserInfo(user_id)
-        if user:
-            return jsonify(user)
-        else:
-            return jsonify({"error": "User not found"}), 404
+        
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
