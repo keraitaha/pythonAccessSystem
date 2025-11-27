@@ -73,6 +73,19 @@ class AccessSystem:
                 FOREIGN KEY (userId) REFERENCES users (id)
             )
         ''')
+
+        # Face templates table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS faceTemplates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                userId INTEGER NOT NULL,
+                userName TEXT NOT NULL,
+                faceTemplate TEXT,
+                photoData TEXT,
+                enrollmentDate TEXT NOT NULL,
+                FOREIGN KEY (userId) REFERENCES users (id)
+            )
+        ''')
         
         # Access log table
         cursor.execute('''
@@ -221,6 +234,72 @@ class AccessSystem:
             }
         return None
     
+    def addFaceTemplate():
+        # Add face template for a user
+        try:
+            data = request.get_json()
+            
+            if not data:
+                return jsonify({"error": "No JSON data provided"}), 400
+            
+            # Validate required fields
+            requiredFields = ['userId', 'userName']
+            for field in requiredFields:
+                if field not in data:
+                    return jsonify({"error": f"Missing required field: {field}"}), 400
+            
+            userId = data['userId']
+            userName = data['userName']
+            faceTemplates = data.get('faceTemplates', [])
+            photos = data.get('photos', [])
+            
+            # Check if user exists
+            userInfo = system.getUserInfo(int(userId))
+            if not userInfo:
+                return jsonify({"error": f"User with ID {userId} not found"}), 404
+            
+            # Validate limits
+            if len(faceTemplates) > 20:
+                return jsonify({"error": "Maximum 20 face templates allowed"}), 400
+            
+            if len(photos) > 5:
+                return jsonify({"error": "Maximum 5 photos allowed"}), 400
+            
+            # Store in database
+            enrollmentDate = datetime.datetime.now().isoformat()
+            conn = sqlite3.connect(system.dbPath)
+            cursor = conn.cursor()
+            
+            templatesStored = 0
+            for i, faceTemplate in enumerate(faceTemplates):
+                photoToStore = photos[i] if i < len(photos) else ""
+                
+                cursor.execute('''
+                    INSERT INTO faceTemplates (userId, userName, faceTemplate, photoData, enrollmentDate)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (userId, userName, faceTemplate, photoToStore, enrollmentDate))
+                templatesStored += 1
+            
+            conn.commit()
+            conn.close()
+            
+            print(f"Face enrollment stored - UserID: {userId}, Name: {userName}")
+            print(f"Templates stored: {templatesStored}, Photos stored: {len(photos)}")
+            
+            return jsonify({
+                "message": "Face template enrolled and stored successfully",
+                "userId": userId,
+                "userName": userName,
+                "templatesCount": templatesStored,
+                "photosCount": len(photos),
+                "enrollmentDate": enrollmentDate
+            })
+            
+        except ValueError:
+            return jsonify({"error": "Invalid userId format"}), 400
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    
     def getAccessLogs(self, limit: int = 100) -> List[Dict]:
         # Retrieve access logs from database
         conn = sqlite3.connect(self.dbPath)
@@ -273,37 +352,6 @@ class AccessSystem:
         
         conn.close()
         return users
-    
-    def getAccessStats(self) -> Dict:
-        # Get access statistics
-        conn = sqlite3.connect(self.dbPath)
-        cursor = conn.cursor()
-        
-        # Total access attempts
-        cursor.execute('SELECT COUNT(*) FROM accessLogs')
-        totalAttempts = cursor.fetchone()[0]
-        
-        # Granted access attempts
-        cursor.execute('SELECT COUNT(*) FROM accessLogs WHERE result = ?', (AccessResult.GRANTED.value,))
-        grantedAttempts = cursor.fetchone()[0]
-        
-        # Denied access attempts
-        cursor.execute('SELECT COUNT(*) FROM accessLogs WHERE result = ?', (AccessResult.DENIED.value,))
-        deniedAttempts = cursor.fetchone()[0]
-        
-        # Access by method
-        cursor.execute('SELECT accessMethod, COUNT(*) FROM accessLogs GROUP BY accessMethod')
-        methodStats = {row[0]: row[1] for row in cursor.fetchall()}
-        
-        conn.close()
-        
-        return {
-            "totalAttempts": totalAttempts,
-            "grantedAttempts": grantedAttempts,
-            "deniedAttempts": deniedAttempts,
-            "successRate": (grantedAttempts / totalAttempts * 100) if totalAttempts > 0 else 0,
-            "methodStats": methodStats
-        }
 
 # Initialize Flask app and system
 app = Flask(__name__)
@@ -315,26 +363,35 @@ system = AccessSystem()
 def home():
     # Home endpoint with API information
     return jsonify({
-        "message": "Dahua Access System API",
+        "message": "Access System API",
         "version": "1.0",
         "endpoints": {
             "user_management": {
                 "register_user": "POST /api/users/register",
-                "get_all_users": "GET /api/users",
-                "get_user_by_id": "GET /api/users/<int:user_id>",
-                "get_user_by_card": "GET /api/users/card/<string:card_number>"
+                "get_users": "GET /api/users (use User-Id header for specific user)",
+                "get_user_by_card": "GET /api/users/card/<card_number>"
             },
             "access_logs": {
-                "submit_face_access": "POST /api/access/face",
+                "submit_face_access": "POST /api/access/face", 
                 "submit_card_access": "POST /api/access/card",
                 "get_access_logs": "GET /api/access/logs",
-                "get_access_stats": "GET /api/access/stats"
+                "get_offline_records_json": "GET /api/access/offline-records"
+            },
+            "face_management": {
+                "enroll_face_json": "POST /api/face/enroll",
+                "get_face_templates": "GET /api/face/templates/<user_id>",
+                "enroll_face_dahua": "POST /cgi-bin/FaceInfoManager.cgi?action=add"
+            },
+            "dahua_compatible": {
+                "get_offline_records": "GET /cgi-bin/recordFinder.cgi?action=find&name=AccessControlCardRec&[params]",
+                "enroll_face": "POST /cgi-bin/FaceInfoManager.cgi?action=add"
             }
         }
     })
 
 # USER MANAGEMENT API
 
+# ENROLL USER API
 @app.route('/api/users/register', methods=['POST'])
 def register_user():
     # Register a new user
@@ -364,18 +421,19 @@ def register_user():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# FIND USER API
 @app.route('/api/users', methods=['GET'])
 def get_users():
     # Get all users or specific user by ID from header
     try:
         # Check if user ID is provided in header
-        user_id_header = request.headers.get('User-Id')
+        userIdHeader = request.headers.get('User-Id')
         
-        if user_id_header and user_id_header != "":
+        if userIdHeader and userIdHeader != "":
             try:
                 # Get specific user
-                user_id = int(user_id_header)
-                user = system.getUserInfo(user_id)
+                userId = int(userIdHeader)
+                user = system.getUserInfo(userId)
                 if user:
                     return jsonify({
                         "message": "User found",
@@ -384,13 +442,13 @@ def get_users():
                 else:
                     return jsonify({
                         "error": "User not found",
-                        "userId": user_id
+                        "userId": userId
                     }), 404
                     
             except ValueError:
                 return jsonify({
                     "error": "Invalid user ID format. Must be a number.",
-                    "providedId": user_id_header
+                    "providedId": userIdHeader
                 }), 400
         
         # If no user ID header, return all users
@@ -403,11 +461,12 @@ def get_users():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route('/api/users/card/<string:card_number>', methods=['GET'])
-def get_user_by_card(card_number):
+# FIND USER BY CARD API
+@app.route('/api/users/card/<string:cardNumber>', methods=['GET'])
+def get_user_by_card(cardNumber):
     # Get user information by card number
     try:
-        user = system.getUserByCard(card_number)
+        user = system.getUserByCard(cardNumber)
         if user:
             return jsonify(user)
         else:
@@ -415,8 +474,73 @@ def get_user_by_card(card_number):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ACCESS LOGS API
+# ENROLL FACE TEMPLATE API
+@app.route('/cgi-bin/FaceInfoManager.cgi', methods=['POST'])
+def manageFaceInfo():
+    # Manage face templates (Dahua API compatible)
+    try:
+        # Get action parameter from query string
+        action = request.args.get('action')
+        
+        if action == 'add':
+            return system.addFaceTemplate()
+        else:
+            return "error=Unsupported action", 400
+    except Exception as e:
+        return f"error={str(e)}", 500
 
+@app.route('/api/face/enroll', methods=['POST'])
+def enrollFaceJson():
+    #Enroll face template (JSON version - no storage)
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({"error": "No JSON data provided"}), 400
+        
+        # Validate required fields
+        requiredFields = ['userId', 'userName']
+        for field in requiredFields:
+            if field not in data:
+                return jsonify({"error": f"Missing required field: {field}"}), 400
+        
+        userId = data['userId']
+        userName = data['userName']
+        faceTemplates = data.get('faceTemplates', [])
+        photos = data.get('photos', [])
+        
+        # Check if user exists
+        userInfo = system.getUserInfo(int(userId))
+        if not userInfo:
+            return jsonify({"error": f"User with ID {userId} not found"}), 404
+        
+        # Validate limits
+        if len(faceTemplates) > 20:
+            return jsonify({"error": "Maximum 20 face templates allowed"}), 400
+        
+        if len(photos) > 5:
+            return jsonify({"error": "Maximum 5 photos allowed"}), 400
+        
+        # Log the enrollment (no database storage)
+        print(f"✓ Face enrollment received - UserID: {userId}, Name: {userName}")
+        print(f"  Templates: {len(faceTemplates)}, Photos: {len(photos)}")
+        print(f"  Note: Data not persisted in mock database")
+        
+        return jsonify({
+            "message": "Face template enrollment received successfully",
+            "note": "Face data not stored in mock database",
+            "userId": userId,
+            "userName": userName,
+            "templatesCount": len(faceTemplates),
+            "photosCount": len(photos)
+        })
+        
+    except ValueError:
+        return jsonify({"error": "Invalid userId format"}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# LOG FR ACCESS API
 @app.route('/api/access/face', methods=['POST'])
 def submit_face_access():
     # Submit face access result
@@ -443,6 +567,7 @@ def submit_face_access():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# LOG CARD ACCESS API
 @app.route('/api/access/card', methods=['POST'])
 def submit_card_access():
     # Submit card access result
@@ -469,6 +594,9 @@ def submit_card_access():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# ACCESS LOGS API
+
+# GET ACCESS LOGS API
 @app.route('/api/access/logs', methods=['GET'])
 def get_access_logs():
     # Get access logs
@@ -482,12 +610,222 @@ def get_access_logs():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route('/api/access/stats', methods=['GET'])
-def get_access_stats():
-    # Get access statistics
+# OFFLINE ACCESS RECORDS API
+@app.route('/cgi-bin/recordFinder.cgi', methods=['GET'])
+def getOfflineAccessRecords():
+    # Get offline access records from device (Dahua API compatible)
     try:
-        stats = system.getAccessStats()
-        return jsonify(stats)
+        # Get query parameters
+        action = request.args.get('action')
+        name = request.args.get('name')
+        
+        # Validate required parameters
+        if action != 'find':
+            return "action=find", 400
+        
+        if name != 'AccessControlCardRec':
+            return "name=AccessControlCardRec", 400
+        
+        # Get optional parameters
+        count = request.args.get('count', 1024, type=int)
+        startTime = request.args.get('StartTime')
+        endTime = request.args.get('EndTime')
+        cardNo = request.args.get('condition.CardNo')
+        
+        # Build query conditions based on parameters
+        queryConditions = []
+        params = []
+        
+        if startTime and endTime:
+            queryConditions.append("timestamp BETWEEN ? AND ?")
+            params.extend([startTime, endTime])
+        elif startTime:
+            queryConditions.append("timestamp >= ?")
+            params.append(startTime)
+        elif endTime:
+            queryConditions.append("timestamp <= ?")
+            params.append(endTime)
+            
+        # Build the SQL query
+        whereClause = " AND ".join(queryConditions) if queryConditions else "1=1"
+        
+        # Modified query to match Dahua record structure
+        conn = sqlite3.connect(system.dbPath)
+        cursor = conn.cursor()
+        
+        # This query transforms our access logs into Dahua-compatible format
+        cursor.execute(f'''
+            SELECT 
+                al.id as RecNo,
+                CAST(strftime('%s', al.timestamp) as INTEGER) as CreateTime,
+                u.cardNumber as CardNo,
+                u.name as CardName,
+                u.name as UserID,
+                CASE 
+                    WHEN al.accessMethod = 'face' THEN 'Entry'
+                    ELSE 'Entry'
+                END as Type,
+                CASE 
+                    WHEN al.result = 'granted' THEN 1
+                    ELSE 0
+                END as Status,
+                CASE 
+                    WHEN al.accessMethod = 'face' THEN 15
+                    WHEN al.accessMethod = 'card' THEN 1
+                    ELSE 1
+                END as Method,
+                1 as Door,
+                al.deviceId as ReaderID,
+                al.timestamp as originalTimestamp
+            FROM accessLogs al
+            LEFT JOIN users u ON al.userId = u.id
+            WHERE {whereClause}
+            ORDER BY al.timestamp DESC
+            LIMIT ?
+        ''', params + [count])
+        
+        records = cursor.fetchall()
+        conn.close()
+        
+        # Convert to Dahua response format
+        formattedRecords = []
+        for record in records:
+            (recNo, createTime, cardNo, cardName, userId, 
+             recordType, status, method, door, readerId, originalTimestamp) = record
+            
+            formattedRecord = {
+                "RecNo": recNo,
+                "CreateTime": createTime,
+                "CardNo": cardNo if cardNo else "",
+                "CardName": cardName if cardName else "Unknown",
+                "CardType": 0,  # Ordinary card
+                "UserID": userId if userId else "Unknown",
+                "Type": recordType,
+                "Status": status,
+                "Method": method,
+                "Door": door,
+                "ReaderID": readerId,
+                "ErrorCode": 0 if status == 1 else 1,
+                "URL": "",
+                "RecordURL": "",
+                "IsOverTemperature": False,
+                "TemperatureUnit": 0,
+                "CurrentTemperature": 36.5,
+                "CitizenIDResult": False
+            }
+            formattedRecords.append(formattedRecord)
+        
+        # Prepare response in key=value format
+        responseLines = [
+            f"totalCount={len(formattedRecords)}",
+            f"found={len(formattedRecords)}"
+        ]
+        
+        # Add each record
+        for i, record in enumerate(formattedRecords):
+            for key, value in record.items():
+                if value is not None:
+                    if isinstance(value, bool):
+                        value = str(value).lower()
+                    elif isinstance(value, (int, float)):
+                        value = str(value)
+                    responseLines.append(f"records[{i}].{key}={value}")
+        
+        # Return as plain text with key=value format
+        return "\n".join(responseLines), 200, {'Content-Type': 'text/plain'}
+        
+    except Exception as e:
+        return f"error={str(e)}", 500
+
+@app.route('/api/access/offline-records', methods=['GET'])
+def getOfflineAccessRecordsJson():
+    # Get offline access records in JSON format
+    try:
+        # Get query parameters
+        count = request.args.get('Count', 1024, type=int)
+        startTime = request.args.get('StartTime')
+        endTime = request.args.get('EndTime')
+        cardNo = request.args.get('CardNo')
+        
+        # Build query conditions
+        query_conditions = []
+        params = []
+        
+        if startTime and endTime:
+            query_conditions.append("timestamp BETWEEN ? AND ?")
+            params.extend([startTime, endTime])
+        
+        where_clause = " AND ".join(query_conditions) if query_conditions else "1=1"
+        
+        # Query the database
+        conn = sqlite3.connect(system.dbPath)
+        cursor = conn.cursor()
+        
+        cursor.execute(f'''
+            SELECT 
+                al.id as RecNo,
+                CAST(strftime('%s', al.timestamp) as INTEGER) as CreateTime,
+                u.cardNumber as CardNo,
+                u.name as CardName,
+                u.name as UserID,
+                CASE 
+                    WHEN al.accessMethod = 'face' THEN 'Entry'
+                    ELSE 'Entry'
+                END as Type,
+                CASE 
+                    WHEN al.result = 'granted' THEN 1
+                    ELSE 0
+                END as Status,
+                CASE 
+                    WHEN al.accessMethod = 'face' THEN 15
+                    WHEN al.accessMethod = 'card' THEN 1
+                    ELSE 1
+                END as Method,
+                1 as Door,
+                al.deviceId as ReaderID
+            FROM accessLogs al
+            LEFT JOIN users u ON al.userId = u.id
+            WHERE {where_clause}
+            ORDER BY al.timestamp DESC
+            LIMIT ?
+        ''', params + [count])
+        
+        records = cursor.fetchall()
+        conn.close()
+        
+        # Convert to desired format
+        formatted_records = []
+        for record in records:
+            (rec_no, create_time, cardNo, card_name, userId, 
+             record_type, status, method, door, reader_id) = record
+            
+            formatted_records.append({
+                "RecNo": rec_no,
+                "CreateTime": create_time,
+                "CardNo": cardNo if cardNo else "",
+                "CardName": card_name if card_name else "Unknown",
+                "CardType": 0,
+                "UserID": userId if userId else "Unknown",
+                "Type": record_type,
+                "Status": status,
+                "Method": method,
+                "Door": door,
+                "ReaderID": reader_id,
+                "ErrorCode": 0 if status == 1 else 1,
+                "URL": "",
+                "RecordURL": "",
+                "IsOverTemperature": False,
+                "TemperatureUnit": 0,
+                "CurrentTemperature": 36.5,
+                "CitizenIDResult": False
+            })
+        
+        return jsonify({
+            "totalCount": len(formatted_records),
+            "found": len(formatted_records),
+            "records": formatted_records
+        })
+        
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
